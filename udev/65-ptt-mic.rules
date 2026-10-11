@@ -1,0 +1,5 @@
+# Seat access for the virtual pointer created by ptt-mic.
+# phys is input-remapper/ptt-mic* so input-remapper's autoload rule skips it.
+# Numbered before 70-mouse.rules and 71-seat.rules so ID_BUS is set in time
+# for the mouse hwdb import, and uaccess is set in time for the seat tag.
+ACTION=="add", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{phys}=="input-remapper/ptt-mic*", ENV{ID_BUS}="usb", TAG+="uaccess"

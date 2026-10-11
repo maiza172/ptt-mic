@@ -1,0 +1,12 @@
+[Unit]
+Description=Push-to-unmute the default microphone from a configured evdev button
+After=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/ptt-mic
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,467 @@
+#!/usr/bin/python3
+"""Push-to-unmute a PipeWire source from an evdev button.
+
+Hold the configured button to unmute the default microphone. Release mutes it.
+Discord and Vesktop on GNOME Wayland do not receive mouse buttons for their
+own push-to-talk, so this mutes the source those apps are already capturing.
+
+When the virtual pointer is readable, the physical device is grabbed and the
+button is not forwarded. That needs /etc/udev/rules.d/65-ptt-mic.rules, which
+tags phys input-remapper/ptt-mic* with uaccess. Without that rule the button
+still changes mute and also keeps its normal action.
+
+Config: ~/.config/ptt-mic/config
+"""
+
+import glob
+import os
+import queue
+import select
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+from evdev import InputDevice, InputEvent, UInput, ecodes
+
+PHYS = "input-remapper/ptt-mic"
+WPCTL = os.environ.get("PTT_MIC_WPCTL", "/usr/bin/wpctl")
+
+stop = False
+wake_r, wake_w = os.pipe()
+os.set_blocking(wake_r, False)
+
+
+def log(msg):
+    print(f"ptt-mic: {msg}", flush=True)
+
+
+def config_path():
+    override = os.environ.get("PTT_MIC_CONFIG")
+    if override:
+        return override
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "ptt-mic", "config")
+
+
+def resolve_button(name):
+    text = name.strip()
+    if text.isdigit():
+        return int(text), text
+    key = text.upper()
+    if key in ecodes.ecodes and isinstance(ecodes.ecodes[key], int):
+        return ecodes.ecodes[key], key
+    raise SystemExit(f"ptt-mic: unknown button {name!r}. Try BTN_SIDE or run ptt-mic --list-devices")
+
+
+def load_config(path):
+    if not os.path.isfile(path):
+        raise SystemExit(
+            f"ptt-mic: missing {path}\n"
+            "Create it with device_name and button. Example:\n"
+            "  device_name = Logitech G309\n"
+            "  button = BTN_SIDE"
+        )
+    values = {}
+    with open(path) as handle:
+        for lineno, raw in enumerate(handle, 1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if "=" not in line:
+                raise SystemExit(f"ptt-mic: {path}:{lineno}: expected key = value")
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+    device_name = values.get("device_name", "")
+    button_text = values.get("button", "")
+    if not device_name or not button_text:
+        raise SystemExit(f"ptt-mic: {path} needs device_name and button")
+    button, button_name = resolve_button(button_text)
+    virt_name = values.get("virt_name") or f"{device_name} pointer"
+    return {
+        "device_name": device_name,
+        "button": button,
+        "button_name": button_name,
+        "virt_name": virt_name,
+        "path": path,
+    }
+
+
+def on_signal(_signum, _frame):
+    global stop
+    stop = True
+    try:
+        os.write(wake_w, b"\n")
+    except OSError:
+        pass
+
+
+def run_wpctl(muted):
+    state = "1" if muted else "0"
+    result = subprocess.run(
+        [WPCTL, "set-mute", "@DEFAULT_AUDIO_SOURCE@", state],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout).strip()
+        log(f"wpctl set-mute {state} failed ({result.returncode}): {err}")
+
+
+class Mic:
+    """Apply mute changes in order, off the input thread."""
+
+    def __init__(self):
+        self._q = queue.Queue()
+        self._last = None
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def set_muted(self, muted):
+        self._q.put(bool(muted))
+
+    def close(self):
+        self._q.put(None)
+        self._thread.join(timeout=2)
+
+    def _loop(self):
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            batch = [item]
+            while True:
+                try:
+                    nxt = self._q.get_nowait()
+                except queue.Empty:
+                    break
+                if nxt is None:
+                    self._apply(batch)
+                    return
+                batch.append(nxt)
+            self._apply(batch)
+
+    def _apply(self, batch):
+        for muted in batch:
+            if muted == self._last:
+                continue
+            run_wpctl(muted)
+            self._last = muted
+
+
+def process_frame(frame, button):
+    """Return (events to forward, muted or None).
+
+    muted False is unmute (button pressed). muted True is mute (released).
+    Repeat events (value 2) do not change mute. The button and the MSC_SCAN
+    that belongs to it are dropped. Other events in the same frame are kept.
+    The passthrough list is a copy so the caller can reuse its buffer.
+    """
+    held = [e for e in frame if e.type == ecodes.EV_KEY and e.code == button]
+    if not held:
+        return list(frame), None
+    muted = None
+    for event in held:
+        if event.value == 1:
+            muted = False
+        elif event.value == 0:
+            muted = True
+    out = []
+    index = 0
+    while index < len(frame):
+        event = frame[index]
+        nxt = frame[index + 1] if index + 1 < len(frame) else None
+        if (
+            event.type == ecodes.EV_MSC
+            and nxt is not None
+            and nxt.type == ecodes.EV_KEY
+            and nxt.code == button
+        ):
+            index += 2
+            continue
+        if event.type == ecodes.EV_KEY and event.code == button:
+            index += 1
+            continue
+        if event.type == ecodes.EV_SYN:
+            index += 1
+            continue
+        out.append(event)
+        index += 1
+    if out:
+        last = frame[-1]
+        out.append(InputEvent(last.sec, last.usec, ecodes.EV_SYN, ecodes.SYN_REPORT, 0))
+    return out, muted
+
+
+def clone_events(dev, button):
+    events = {}
+    for ev_type, codes in dev.capabilities(verbose=False, absinfo=True).items():
+        if ev_type in (ecodes.EV_SYN, ecodes.EV_FF, ecodes.EV_LED):
+            continue
+        if ev_type == ecodes.EV_KEY:
+            codes = [code for code in codes if code != button]
+        events[ev_type] = codes
+    return events
+
+
+def event_node(name, phys):
+    for namefile in glob.glob("/sys/class/input/input*/name"):
+        try:
+            if open(namefile).read().strip() != name:
+                continue
+            parent = os.path.dirname(namefile)
+            got = open(os.path.join(parent, "phys")).read().strip()
+        except OSError:
+            continue
+        if got != phys:
+            continue
+        for entry in os.listdir(parent):
+            if entry.startswith("event"):
+                return f"/dev/input/{entry}"
+    return None
+
+
+def wait_readable(name, phys, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and not stop:
+        path = event_node(name, phys)
+        if path:
+            try:
+                dev = InputDevice(path)
+            except OSError:
+                dev = None
+            if dev is not None:
+                dev.close()
+                return path
+        time.sleep(0.05)
+    return None
+
+
+def is_target(dev, cfg):
+    phys = dev.phys or ""
+    if phys.startswith("input-remapper/"):
+        return False
+    if dev.name != cfg["device_name"]:
+        return False
+    keys = dev.capabilities().get(ecodes.EV_KEY, [])
+    return cfg["button"] in keys
+
+
+def find_device(cfg):
+    from evdev import list_devices
+
+    for path in list_devices():
+        try:
+            dev = InputDevice(path)
+        except OSError:
+            continue
+        if is_target(dev, cfg):
+            return dev
+        dev.close()
+    return None
+
+
+def wait_for_device(cfg):
+    while not stop:
+        dev = find_device(cfg)
+        if dev is not None:
+            return dev
+        time.sleep(0.5)
+    return None
+
+
+def open_clone(dev, cfg):
+    info = dev.info
+    return UInput(
+        events=clone_events(dev, cfg["button"]),
+        name=cfg["virt_name"],
+        vendor=info.vendor,
+        product=info.product,
+        version=info.version,
+        bustype=info.bustype,
+        phys=PHYS,
+    )
+
+
+def drain_wake():
+    try:
+        while os.read(wake_r, 64):
+            pass
+    except BlockingIOError:
+        pass
+
+
+def pump_events(dev, ui, mic, button):
+    os.set_blocking(dev.fd, False)
+    buf = []
+    while not stop:
+        readable, _, _ = select.select([dev.fd, wake_r], [], [])
+        if wake_r in readable:
+            drain_wake()
+            break
+        try:
+            events = list(dev.read())
+        except BlockingIOError:
+            continue
+        except OSError:
+            raise
+        for event in events:
+            buf.append(event)
+            if event.type != ecodes.EV_SYN:
+                continue
+            out, muted = process_frame(buf, button)
+            buf = []
+            if muted is not None:
+                mic.set_muted(muted)
+            if ui is not None:
+                for forwarded in out:
+                    ui.write_event(forwarded)
+
+
+def serve_device(dev, mic, cfg):
+    ui = open_clone(dev, cfg)
+    grabbed = False
+    button_name = cfg["button_name"]
+    try:
+        path = wait_readable(cfg["virt_name"], PHYS, 5)
+        if path is None:
+            log(
+                f"virtual pointer is not readable; {button_name} keeps its normal action. "
+                "Install /etc/udev/rules.d/65-ptt-mic.rules and restart this service."
+            )
+            ui.close()
+            ui = None
+            pump_events(dev, None, mic, cfg["button"])
+            return
+        try:
+            dev.grab()
+            grabbed = True
+        except OSError as err:
+            log(f"could not grab {dev.path} ({err}); {button_name} keeps its normal action")
+            ui.close()
+            ui = None
+            pump_events(dev, None, mic, cfg["button"])
+            return
+        log(f"grabbed {dev.path}; {button_name} is push-to-unmute only (forwarding {path})")
+        pump_events(dev, ui, mic, cfg["button"])
+    finally:
+        if grabbed:
+            try:
+                dev.ungrab()
+            except OSError:
+                pass
+        if ui is not None:
+            ui.close()
+
+
+def serve(cfg):
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    mic = Mic()
+    mic.set_muted(True)
+    try:
+        while not stop:
+            dev = wait_for_device(cfg)
+            if dev is None:
+                break
+            log(f"watching {dev.path} ({dev.name}) button {cfg['button_name']}")
+            try:
+                serve_device(dev, mic, cfg)
+            except OSError as err:
+                log(f"device went away: {err}")
+            finally:
+                dev.close()
+            if not stop:
+                time.sleep(0.5)
+    finally:
+        mic.set_muted(True)
+        mic.close()
+
+
+def list_devices():
+    from evdev import list_devices
+
+    interesting = (
+        "BTN_LEFT",
+        "BTN_RIGHT",
+        "BTN_MIDDLE",
+        "BTN_SIDE",
+        "BTN_EXTRA",
+        "BTN_FORWARD",
+        "BTN_BACK",
+    )
+    for path in sorted(list_devices()):
+        try:
+            dev = InputDevice(path)
+        except OSError as err:
+            print(f"{path}\tunreadable\t{err}")
+            continue
+        keys = dev.capabilities().get(ecodes.EV_KEY, [])
+        buttons = [name for name in interesting if ecodes.ecodes.get(name) in keys]
+        print(f"{path}\t{dev.name}\t{dev.phys}\t{','.join(buttons)}")
+        dev.close()
+
+
+def _ev(type_, code, value):
+    return InputEvent(0, 0, type_, code, value)
+
+
+def self_test():
+    button = ecodes.BTN_SIDE
+    press = [_ev(ecodes.EV_MSC, ecodes.MSC_SCAN, 0x90004), _ev(ecodes.EV_KEY, button, 1), _ev(ecodes.EV_SYN, 0, 0)]
+    out, muted = process_frame(press, button)
+    assert out == [] and muted is False, (out, muted)
+
+    release = [_ev(ecodes.EV_KEY, button, 0), _ev(ecodes.EV_SYN, 0, 0)]
+    out, muted = process_frame(release, button)
+    assert out == [] and muted is True, (out, muted)
+
+    repeat = [_ev(ecodes.EV_KEY, button, 2), _ev(ecodes.EV_SYN, 0, 0)]
+    out, muted = process_frame(repeat, button)
+    assert out == [] and muted is None, (out, muted)
+
+    move = [
+        _ev(ecodes.EV_REL, ecodes.REL_X, 3),
+        _ev(ecodes.EV_KEY, button, 1),
+        _ev(ecodes.EV_SYN, 0, 0),
+    ]
+    out, muted = process_frame(move, button)
+    assert muted is False
+    assert [e.code for e in out if e.type == ecodes.EV_KEY] == []
+    assert [(e.type, e.code, e.value) for e in out] == [
+        (ecodes.EV_REL, ecodes.REL_X, 3),
+        (ecodes.EV_SYN, ecodes.SYN_REPORT, 0),
+    ]
+
+    other = [_ev(ecodes.EV_KEY, ecodes.BTN_LEFT, 1), _ev(ecodes.EV_SYN, 0, 0)]
+    out, muted = process_frame(other, button)
+    assert out == other and muted is None
+
+    log("frame tests passed")
+    return 0
+
+
+def main(argv):
+    if "--self-test" in argv:
+        return self_test()
+    if "--list-devices" in argv:
+        list_devices()
+        return 0
+    cfg = load_config(config_path())
+    if "--print-config" in argv:
+        print(
+            f"config={cfg['path']}\n"
+            f"device_name={cfg['device_name']}\n"
+            f"button={cfg['button_name']} ({cfg['button']})\n"
+            f"virt_name={cfg['virt_name']}\n"
+            f"phys={PHYS}"
+        )
+        return 0
+    serve(cfg)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

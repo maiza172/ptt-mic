@@ -1,0 +1,8 @@
+# Push-to-unmute the default PipeWire source.
+# Press unmutes. Release mutes.
+# ptt-mic --list-devices shows names and buttons.
+# BTN_SIDE is the rear thumb button (mouse 4). BTN_EXTRA is the front one.
+# Optional: virt_name = My mouse pointer
+
+device_name = Logitech G309
+button = BTN_SIDE
