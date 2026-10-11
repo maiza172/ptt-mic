@@ -6,7 +6,7 @@ Discord and Vesktop on GNOME Wayland do not receive mouse buttons for their own 
 
 The physical device is grabbed and every event except the configured button is replayed through a virtual pointer. The button does not also act as Back. The default source stays muted while the button is up, including when the service starts and when it stops.
 
-Tested on Bazzite GNOME Wayland with a Logitech G309, where mouse 4 is `BTN_SIDE`. The device name and button come from a config file.
+Tested on Bazzite GNOME Wayland with a Logitech G309, where mouse 4 is `BTN_SIDE`. The device name and button come from a config file. Write-up on r/Bazzite: https://www.reddit.com/r/Bazzite/comments/1x2vupe/mouse_side_button_as_pushtounmute_for/
 
 ## Requirements
 
