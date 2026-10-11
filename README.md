@@ -15,7 +15,9 @@ Tested on Bazzite GNOME Wayland with a Logitech G309, where mouse 4 is `BTN_SIDE
 - A writable `/dev/uinput`
 - A session that can already read the real mouse (logind does this for the active seat)
 
-Both `python3-evdev` and `wpctl` ship on current Bazzite images. Nothing needs to be layered with `rpm-ostree`. Membership in group `input` is not required.
+Both `python3-evdev` and `wpctl` ship on current Bazzite images. Nothing needs to be layered with `rpm-ostree` there. Membership in group `input` is not required.
+
+The same pieces are what a Fedora, Ubuntu, Arch, or KDE session already has: a systemd user session, PipeWire, and logind. Logind is what lets the active seat read the real mouse and write `/dev/uinput`. The script's shebang is `/usr/bin/python3`, so it uses the distro interpreter. If `python3 -c 'import evdev'` fails, install the distro package (`python3-evdev` on Fedora and Ubuntu, `python-evdev` on Arch).
 
 ## Install
 
@@ -25,16 +27,9 @@ cd ptt-mic
 ./install.sh
 ```
 
-`install.sh` copies the script, a config if you do not already have one, and a user service. It does not touch `/etc`. Install the udev rule it prints:
+`install.sh` copies the script, a config if you do not already have one, and a user service. It mutes the current default source. It does not touch `/etc`.
 
-```sh
-sudo install -m 644 udev/65-ptt-mic.rules /etc/udev/rules.d/65-ptt-mic.rules
-sudo udevadm control --reload-rules
-systemctl --user daemon-reload
-systemctl --user enable --now ptt-mic.service
-```
-
-Edit `~/.config/ptt-mic/config` before relying on the button. `device_name` must match the evdev name exactly.
+Edit `~/.config/ptt-mic/config` before starting the service. `device_name` must match the evdev name exactly. `ptt-mic --list-devices` prints the names. The example is a Logitech G309, so any other mouse waits forever until that line is changed.
 
 ```
 device_name = Logitech G309
@@ -44,11 +39,15 @@ button = BTN_SIDE
 `ptt-mic --list-devices` prints every event node it can open, with the usual mouse buttons. `BTN_SIDE` is the rear thumb button (mouse 4). `BTN_EXTRA` is the front one (mouse 5). A numeric evdev code is also accepted. Optional `virt_name` overrides the virtual pointer name. The default is `<device_name> pointer`.
 
 ```sh
+sudo install -m 644 udev/65-ptt-mic.rules /etc/udev/rules.d/65-ptt-mic.rules
+sudo udevadm control --reload-rules
+systemctl --user daemon-reload
+systemctl --user enable --now ptt-mic.service
 ptt-mic --print-config
 journalctl --user -u ptt-mic.service -e
 ```
 
-A successful start logs `grabbed ... BTN_SIDE is push-to-unmute only`. A second open of that event node then fails with "Device or resource busy".
+A successful start logs `grabbed ... is push-to-unmute only`. A second open of that event node then fails with "Device or resource busy".
 
 ## Microphone
 
@@ -62,6 +61,34 @@ wpctl set-mute @DEFAULT_AUDIO_SOURCE@ 1   # release: mute
 The source is whichever PipeWire currently marks as the default. Check it with `wpctl status`. This is system mute, not the mute icon inside Discord.
 
 `PTT_MIC_CONFIG` overrides the config path. `PTT_MIC_WPCTL` overrides the `wpctl` binary, which is useful for a dry run.
+
+## Remembered mute
+
+WirePlumber remembers the mute of each microphone on its own. The state file is `~/.local/state/wireplumber/default-routes`. `wpctl settings` can change the default volume. It has no default-mute switch. A source that has never been muted starts unmuted.
+
+Mute the source that is default right now. WirePlumber restores that mute at the next login. On Bazzite an image update leaves it in place, because the file is in the home directory:
+
+```sh
+wpctl set-mute @DEFAULT_AUDIO_SOURCE@ 1
+```
+
+Clear it for that same source:
+
+```sh
+wpctl set-mute @DEFAULT_AUDIO_SOURCE@ 0
+```
+
+`wpctl get-volume @DEFAULT_AUDIO_SOURCE@` shows whether it is muted. A headset keeps its own mute. Make that headset the default, then run the command once. `ptt-mic` writes this same mute when it starts and when it stops, so the microphone you use with the button stays muted across logins.
+
+`wpctl reset` deletes saved devices, volumes, and routes. Leave it alone when you only want the microphone open again.
+
+## Limits
+
+- One device and one button. A second copy uses the same virtual `phys` and will not grab.
+- PipeWire. This does not speak PulseAudio.
+- If the default source changes while the button is held, the release mutes the new source. The one that was default at the press stays as it was.
+- Without the udev rule the service still mutes, and the button still clicks.
+- A Logitech mouse that can divert the button in Solaar should use that. This watcher is for buttons that still arrive as evdev events.
 
 ## The udev rule
 
